@@ -15,6 +15,7 @@ import { useAuthStore } from '@/stores/authStore'
 
 // All supported brokers with their display names and auth types
 const allBrokers = [
+  { id: 'hdfc_investright', name: 'HDFC Investright', authType: 'oauth' },
   { id: 'fivepaisa', name: '5 Paisa', authType: 'totp' },
   { id: 'fivepaisaxts', name: '5 Paisa (XTS)', authType: 'totp' },
   { id: 'aliceblue', name: 'Alice Blue', authType: 'totp' },
