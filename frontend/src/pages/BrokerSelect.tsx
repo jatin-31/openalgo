@@ -245,7 +245,7 @@ export default function BrokerSelect() {
                     </SelectTrigger>
                     <SelectContent>
                       {allBrokers
-                        .filter((broker) => broker.id === brokerConfig?.broker_name)
+                        .filter((broker) => broker.id === brokerConfig?.broker_name)  // ← THIS FILTERS!
                         .map((broker) => (
                           <SelectItem key={broker.id} value={broker.id}>
                             {broker.name}
