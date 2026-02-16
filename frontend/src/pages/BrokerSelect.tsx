@@ -53,14 +53,12 @@ interface BrokerConfig {
   redirect_url: string
 }
 
-// Helper function to get Flattrade API key
 function getFlattradeApiKey(fullKey: string): string {
   if (!fullKey) return ''
   const parts = fullKey.split(':::')
   return parts.length > 1 ? parts[1] : fullKey
 }
 
-// Generate random state for OAuth
 function generateRandomState(): string {
   const length = 16
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
@@ -80,7 +78,6 @@ export default function BrokerSelect() {
   const [brokerConfig, setBrokerConfig] = useState<BrokerConfig | null>(null)
 
   useEffect(() => {
-    // Fetch broker configuration
     const fetchBrokerConfig = async () => {
       try {
         const response = await fetch('/auth/broker-config', {
@@ -90,8 +87,10 @@ export default function BrokerSelect() {
 
         if (data.status === 'success') {
           setBrokerConfig(data)
-          // Auto-select the configured broker
-          setSelectedBroker(data.broker_name)
+          // Only auto-select if a broker is configured
+          if (data.broker_name) {
+            setSelectedBroker(data.broker_name)
+          }
         } else {
           setError(data.message || 'Failed to load broker configuration')
         }
@@ -123,7 +122,6 @@ export default function BrokerSelect() {
 
     const { broker_api_key, redirect_url } = brokerConfig
 
-    // Build login URL based on broker type (matching original broker.html logic)
     switch (selectedBroker) {
       case 'fivepaisa':
       case 'fivepaisaxts':
@@ -146,7 +144,6 @@ export default function BrokerSelect() {
       case 'tradejini':
       case 'wisdom':
       case 'zebu':
-        // TOTP brokers - redirect to callback page which shows form
         loginUrl = `/${selectedBroker}/callback`
         break
 
@@ -201,7 +198,6 @@ export default function BrokerSelect() {
         return
     }
 
-    // Use setTimeout to ensure state updates complete before navigation
     setTimeout(() => {
       window.location.href = loginUrl
     }, 100)
@@ -219,7 +215,6 @@ export default function BrokerSelect() {
     <div className="min-h-screen flex items-center justify-center py-8 px-4">
       <div className="container max-w-6xl">
         <div className="flex flex-col lg:flex-row items-center justify-between gap-8 lg:gap-16">
-          {/* Right side broker form - Shown first on mobile */}
           <Card className="w-full max-w-md shadow-xl order-1 lg:order-2">
             <CardHeader className="text-center">
               <div className="flex justify-center mb-4">
@@ -288,7 +283,6 @@ export default function BrokerSelect() {
             </CardContent>
           </Card>
 
-          {/* Left side content - Shown second on mobile */}
           <div className="flex-1 max-w-xl text-center lg:text-left order-2 lg:order-1">
             <h1 className="text-4xl lg:text-5xl font-bold mb-6">
               Connect Your <span className="text-primary">Broker</span>

@@ -1,13 +1,14 @@
-# sandbox/order_manager.py
+# sandbox/execution_engine.py
 """
-Order Manager - Handles virtual order placement and validation
+Execution Engine - Monitors and executes pending orders
 
 Features:
-- Order validation (symbol, quantity, price, etc.)
-- Margin checking before order placement
-- Order placement with unique order IDs
-- Order modification and cancellation
-- Support for all order types: MARKET, LIMIT, SL, SL-M
+- Background order monitoring (every 5 seconds configurable)
+- Real-time quote fetching from broker
+- Order execution based on price type (MARKET, LIMIT, SL, SL-M)
+- Trade creation and position updates
+- Rate limit compliance (10 orders/second, 50 API calls/second)
+- Batch processing for efficiency
 """
 
 import os
@@ -22,1012 +23,641 @@ import pytz
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from database.auth_db import get_auth_token_broker
 from database.sandbox_db import SandboxOrders, SandboxPositions, SandboxTrades, db_session
-from database.symbol import SymToken
-from database.token_db import get_symbol_info
-from sandbox.fund_manager import FundManager
+from sandbox.fund_manager import FundManager, reconcile_margin, validate_margin_consistency
+from services.quotes_service import get_multiquotes, get_quotes
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-def is_option(symbol, exchange):
-    """Check if symbol is an option based on exchange and symbol suffix"""
-    if exchange in ["NFO", "BFO", "MCX", "CDS", "BCD", "NCDEX"]:
-        return symbol.endswith("CE") or symbol.endswith("PE")
-    return False
+class ExecutionEngine:
+    """Executes pending orders based on market data"""
 
+    def __init__(self):
+        # Read rate limits from .env (same as API protection)
+        self.order_rate_limit = int(os.getenv("ORDER_RATE_LIMIT", "10 per second").split()[0])
+        self.api_rate_limit = int(os.getenv("API_RATE_LIMIT", "50 per second").split()[0])
+        self.batch_delay = 1.0  # 1 second between batches
 
-def is_future(symbol, exchange):
-    """Check if symbol is a future based on exchange and symbol suffix"""
-    if exchange in ["NFO", "BFO", "MCX", "CDS", "BCD", "NCDEX"]:
-        return symbol.endswith("FUT")
-    return False
-
-
-class OrderManager:
-    """Manages virtual orders for sandbox mode"""
-
-    def __init__(self, user_id):
-        self.user_id = user_id
-        self.fund_manager = FundManager(user_id)
-
-    def place_order(self, order_data):
+    def check_and_execute_pending_orders(self):
         """
-        Place a new order in sandbox mode
-
-        Args:
-            order_data: dict containing order parameters
-                - symbol: str
-                - exchange: str
-                - action: str (BUY/SELL)
-                - quantity: int
-                - price: float (optional for MARKET orders)
-                - trigger_price: float (optional for SL orders)
-                - price_type: str (MARKET/LIMIT/SL/SL-M)
-                - product: str (CNC/NRML/MIS)
-                - strategy: str (optional)
-
-        Returns:
-            tuple: (success: bool, response: dict, status_code: int)
+        Main execution loop - checks all pending orders and executes if conditions met
+        Respects rate limits through batch processing
         """
         try:
-            # Validate order data
-            is_valid, validation_msg = self._validate_order(order_data)
-            if not is_valid:
-                return False, {"status": "error", "message": validation_msg, "mode": "analyze"}, 400
+            # Get all pending orders
+            pending_orders = SandboxOrders.query.filter_by(order_status="open").all()
 
-            # Extract order parameters
-            symbol = order_data["symbol"]
-            exchange = order_data["exchange"]
-            action = order_data["action"].upper()
-            quantity = int(order_data["quantity"])
-            price = Decimal(str(order_data.get("price", 0))) if order_data.get("price") else None
-            trigger_price = (
-                Decimal(str(order_data.get("trigger_price", 0)))
-                if order_data.get("trigger_price")
-                else None
-            )
-            price_type = order_data["price_type"].upper()
-            product = order_data["product"].upper()
-            strategy = order_data.get("strategy", "")
+            if not pending_orders:
+                logger.debug("No pending orders to process")
+                return
 
-            # Get symbol info for lot size validation (from cache)
-            symbol_obj = get_symbol_info(symbol, exchange)
-            if not symbol_obj:
-                return (
-                    False,
-                    {
-                        "status": "error",
-                        "message": f"Symbol {symbol} not found on {exchange}",
-                        "mode": "analyze",
-                    },
-                    400,
-                )
+            logger.info(f"Processing {len(pending_orders)} pending orders")
 
-            # Validate lot size for F&O
-            if exchange in ["NFO", "BFO", "CDS", "BCD", "MCX", "NCDEX"]:
-                lot_size = symbol_obj.lotsize or 1
-                if quantity % lot_size != 0:
-                    return (
-                        False,
-                        {
-                            "status": "error",
-                            "message": f"Quantity must be in multiples of lot size {lot_size}",
-                            "mode": "analyze",
-                        },
-                        400,
-                    )
+            # Group orders by user and symbol for efficient quote fetching
+            orders_by_symbol = {}
+            for order in pending_orders:
+                key = (order.symbol, order.exchange)
+                if key not in orders_by_symbol:
+                    orders_by_symbol[key] = []
+                orders_by_symbol[key].append(order)
 
-            # Validate MIS orders - reject if after square-off time but before market open
-            # Exception: Allow orders that reduce/close existing positions
-            if product == "MIS":
-                from datetime import time as dt_time
+            # Fetch quotes using multiquotes (more efficient - single API call)
+            # Falls back to individual quotes if multiquotes fails
+            quote_cache = {}
+            symbols_list = list(orders_by_symbol.keys())
 
-                from sandbox.squareoff_manager import SquareOffManager
+            # Fetch quotes using multiquotes only (no individual quote fallback to avoid rate limiting)
+            # WebSocket is the primary data source; multiquotes is the fallback
+            quote_cache = self._fetch_quotes_batch(symbols_list)
 
-                som = SquareOffManager()
-                square_off_time = som.square_off_times.get(exchange)
-
-                if square_off_time:
-                    ist = pytz.timezone("Asia/Kolkata")
-                    now = datetime.now(ist)
-                    current_time = now.time()
-
-                    # Market opens at 9:00 AM IST
-                    market_open_time = dt_time(9, 0)
-
-                    # Check if we're in the blocked period
-                    # Two scenarios:
-                    # 1. After square-off time same day: e.g., 15:20 (after 15:15 square-off)
-                    # 2. Before market open next day: e.g., 02:00 (before 09:00 market open)
-                    is_blocked = False
-                    if current_time >= square_off_time:
-                        # After square-off time - block until next day
-                        is_blocked = True
-                    elif current_time < market_open_time:
-                        # Before market open - still blocked from yesterday
-                        is_blocked = True
-
-                    if is_blocked:
-                        # Check if this order will reduce/close an existing OPEN position
-                        existing_position = (
-                            SandboxPositions.query.filter_by(
-                                user_id=self.user_id,
-                                symbol=symbol,
-                                exchange=exchange,
-                                product=product,
-                            )
-                            .filter(SandboxPositions.quantity != 0)
-                            .first()
-                        )
-
-                        # Allow if reducing existing position
-                        # BUY reduces short position (negative qty), SELL reduces long position (positive qty)
-                        is_reducing = False
-                        if existing_position:
-                            if action == "BUY" and existing_position.quantity < 0:
-                                is_reducing = True  # Covering short
-                            elif action == "SELL" and existing_position.quantity > 0:
-                                is_reducing = True  # Closing long
-
-                        # Block only if opening/increasing position, allow if closing/reducing
-                        if not is_reducing:
-                            return (
-                                False,
-                                {
-                                    "status": "error",
-                                    "message": f"MIS orders cannot be placed after square-off time ({square_off_time.strftime('%H:%M')} IST). Trading resumes at 09:00 AM IST.",
-                                    "mode": "analyze",
-                                },
-                                400,
-                            )
-
-            # Track validation for CNC SELL orders
-            cnc_sell_rejection_reason = None
-
-            # Validate SELL orders based on product type
-            # CNC (delivery) requires existing positions/holdings, MIS (intraday) allows short selling
-            if action == "SELL":
-                if product == "CNC":
-                    # CNC SELL orders require existing long positions or holdings
-                    # Check existing position
-                    existing_position = SandboxPositions.query.filter_by(
-                        user_id=self.user_id, symbol=symbol, exchange=exchange, product=product
-                    ).first()
-
-                    # Check holdings (T+1 settled positions)
-                    from database.sandbox_db import SandboxHoldings
-
-                    existing_holdings = SandboxHoldings.query.filter_by(
-                        user_id=self.user_id, symbol=symbol, exchange=exchange
-                    ).first()
-
-                    # Calculate total available quantity
-                    position_qty = (
-                        existing_position.quantity
-                        if existing_position and existing_position.quantity > 0
-                        else 0
-                    )
-                    holdings_qty = (
-                        existing_holdings.quantity
-                        if existing_holdings and existing_holdings.quantity > 0
-                        else 0
-                    )
-                    total_available = position_qty + holdings_qty
-
-                    if total_available <= 0:
-                        cnc_sell_rejection_reason = f"Cannot sell {symbol} in CNC. No positions or holdings available. CNC (delivery) requires existing shares. Use MIS for intraday short selling."
-                    elif quantity > total_available:
-                        cnc_sell_rejection_reason = f"Cannot sell {quantity} shares of {symbol} in CNC. Only {total_available} shares available (Position: {position_qty}, Holdings: {holdings_qty})"
-                    else:
-                        logger.info(
-                            f"CNC SELL validation passed: {symbol} - Available: {total_available} (Pos: {position_qty}, Hold: {holdings_qty}), Requested: {quantity}"
-                        )
-
-                elif product == "MIS":
-                    # MIS allows short selling (negative positions) since it's intraday
-                    logger.info(f"MIS SELL order: {symbol} - Short selling allowed for intraday")
-
-            # Determine price for margin calculation based on order type
-            margin_calculation_price = None
-            cached_quote = None  # Cache quote for reuse in immediate execution
-
-            # Check for existing position early (needed for fallback pricing)
-            temp_existing_position = SandboxPositions.query.filter_by(
-                user_id=self.user_id, symbol=symbol, exchange=exchange, product=product
-            ).first()
-
-            if price_type == "MARKET":
-                # For MARKET orders, fetch current LTP for margin calculation
-                # We need a valid price - reject order if unavailable (no hardcoded fallback)
-                quote_fetch_success = False
-
-                # Attempt 1: Fetch live quote with retry
-                for attempt in range(3):
-                    try:
-                        from sandbox.execution_engine import ExecutionEngine
-
-                        engine = ExecutionEngine()
-                        quote = engine._fetch_quote(symbol, exchange)
-                        if quote and quote.get("ltp") and Decimal(str(quote["ltp"])) > 0:
-                            margin_calculation_price = Decimal(str(quote["ltp"]))
-                            cached_quote = quote  # Cache for immediate execution
-                            logger.debug(
-                                f"Using LTP {margin_calculation_price} for MARKET order margin calculation"
-                            )
-                            quote_fetch_success = True
-                            break
-                    except Exception as e:
-                        logger.debug(f"Quote fetch attempt {attempt + 1} failed: {e}")
-
-                    # Wait before retry (0.3s, 0.6s, 0.9s)
-                    if attempt < 2:
-                        time.sleep(0.3 * (attempt + 1))
-
-                # Attempt 2: Use position's last known LTP as fallback
-                if not quote_fetch_success:
-                    if (
-                        temp_existing_position
-                        and temp_existing_position.ltp
-                        and temp_existing_position.ltp > 0
-                    ):
-                        margin_calculation_price = temp_existing_position.ltp
-                        logger.warning(
-                            f"Quote fetch failed, using last known price {margin_calculation_price} for {symbol}"
-                        )
-                        quote_fetch_success = True
-
-                # Attempt 3: Reject order if no valid price available
-                if not quote_fetch_success:
-                    logger.error(
-                        f"Cannot place MARKET order for {symbol} - unable to fetch current price"
-                    )
-                    return (
-                        False,
-                        {
-                            "status": "error",
-                            "message": f"Cannot place MARKET order for {symbol} - unable to fetch current price. Please try again later or use LIMIT order with a specific price.",
-                            "mode": "analyze",
-                        },
-                        400,
-                    )
-
-            elif price_type == "LIMIT":
-                # For LIMIT orders, use the limit price for margin calculation
-                margin_calculation_price = price
-                logger.debug(f"Using LIMIT price {margin_calculation_price} for margin calculation")
-
-            elif price_type in ["SL", "SL-M"]:
-                # For SL/SL-M orders, use trigger price for margin calculation
-                # This represents the worst-case price at which order will be triggered
-                margin_calculation_price = trigger_price
+            # Log symbols that couldn't be fetched (don't retry individually to avoid rate limits)
+            failed_symbols = [
+                s for s in symbols_list if s not in quote_cache or quote_cache[s] is None
+            ]
+            if failed_symbols:
                 logger.debug(
-                    f"Using trigger price {margin_calculation_price} for {price_type} order margin calculation"
+                    f"{len(failed_symbols)} symbols not available via multiquotes, waiting for WebSocket data"
                 )
 
-            # Validate that we have a valid price for margin calculation
-            if not margin_calculation_price or margin_calculation_price <= 0:
-                return (
-                    False,
-                    {
-                        "status": "error",
-                        "message": f"Invalid price for margin calculation. Please provide valid price/trigger_price for {price_type} order",
-                        "mode": "analyze",
-                    },
-                    400,
-                )
+            # Process orders in batches (respecting order rate limit of 10/second)
+            orders_processed = 0
+            for i in range(0, len(pending_orders), self.order_rate_limit):
+                batch = pending_orders[i : i + self.order_rate_limit]
 
-            # Calculate required margin using the appropriate price
-            margin_required, margin_msg = self.fund_manager.calculate_margin_required(
-                symbol, exchange, product, quantity, margin_calculation_price, action
+                for order in batch:
+                    quote = quote_cache.get((order.symbol, order.exchange))
+                    if quote:
+                        self._process_order(order, quote)
+                        orders_processed += 1
+
+                # Wait 1 second before next batch if more orders remain
+                if i + self.order_rate_limit < len(pending_orders):
+                    time.sleep(self.batch_delay)
+
+            logger.info(f"Processed {orders_processed} orders")
+
+        except Exception as e:
+            logger.exception(f"Error in execution engine: {e}")
+
+    def _fetch_quote(self, symbol, exchange):
+        """
+        Fetch real-time quote for a symbol using API key
+        Returns dict with ltp, high, low, open, close, etc.
+        Returns None if quote cannot be fetched (permission error, API error, etc.)
+        """
+        try:
+            # Get any user's API key for fetching quotes
+            from database.auth_db import ApiKeys, decrypt_token
+
+            api_key_obj = ApiKeys.query.first()
+
+            if not api_key_obj:
+                logger.debug("No API keys found for fetching quotes")
+                return None
+
+            # Decrypt the API key
+            api_key = decrypt_token(api_key_obj.api_key_encrypted)
+
+            # Use quotes service with API key authentication
+            success, response, status_code = get_quotes(
+                symbol=symbol, exchange=exchange, api_key=api_key
             )
 
-            if margin_required is None:
-                return (
-                    False,
-                    {
-                        "status": "error",
-                        "message": f"Unable to calculate margin: {margin_msg}",
-                        "mode": "analyze",
-                    },
-                    400,
-                )
-
-            # Check if this order will close/reduce/reverse an existing position
-            existing_position = SandboxPositions.query.filter_by(
-                user_id=self.user_id, symbol=symbol, exchange=exchange, product=product
-            ).first()
-
-            # Calculate margin to block based on position impact
-            actual_margin_to_block = margin_required
-
-            if existing_position and existing_position.quantity != 0:
-                # Check if order is opposite to position direction
-                if (existing_position.quantity > 0 and action == "SELL") or (
-                    existing_position.quantity < 0 and action == "BUY"
-                ):
-                    # Opposite direction - will reduce or reverse position
-                    existing_qty = abs(existing_position.quantity)
-                    order_qty = quantity
-
-                    if order_qty <= existing_qty:
-                        # Order will only reduce/close position - no new margin needed
-                        actual_margin_to_block = Decimal("0")
-                        logger.info("Order will reduce position - no margin required")
-                    else:
-                        # Order will reverse position - only block margin for excess quantity
-                        excess_qty = order_qty - existing_qty
-                        actual_margin_to_block, _ = self.fund_manager.calculate_margin_required(
-                            symbol, exchange, product, excess_qty, margin_calculation_price, action
-                        )
-                        logger.info(
-                            f"Order will reverse position - margin for {excess_qty} shares: ₹{actual_margin_to_block}"
-                        )
-
-            # Check margin availability and block margin if needed
-            # Margin is required for:
-            # - All BUY orders (long positions)
-            # - SELL orders for options (selling options requires margin)
-            # - SELL orders for futures (short selling futures requires margin)
-            # - SELL orders for equity in MIS (intraday short selling requires margin)
-            # - SELL orders for equity in NRML (if short selling is allowed)
-            # Note: SELL orders for equity in CNC don't need margin blocking (selling owned shares)
-            should_block_margin = False
-
-            if action == "BUY":
-                # All BUY orders require margin
-                should_block_margin = True
-            elif action == "SELL":
-                if is_option(symbol, exchange):
-                    # Selling options requires margin
-                    should_block_margin = True
-                elif is_future(symbol, exchange):
-                    # Short selling futures requires margin
-                    should_block_margin = True
-                elif product in ["MIS", "NRML"]:
-                    # Intraday/margin short selling of equity requires margin
-                    should_block_margin = True
-                # CNC SELL doesn't need margin (selling owned shares)
-
-            if should_block_margin:
-                if actual_margin_to_block > 0:
-                    # Check and block margin only for new exposure
-                    can_trade, margin_check_msg = self.fund_manager.check_margin_available(
-                        actual_margin_to_block
-                    )
-                    if not can_trade:
-                        return (
-                            False,
-                            {"status": "error", "message": margin_check_msg, "mode": "analyze"},
-                            400,
-                        )
-
-                    # Block margin
-                    success, block_msg = self.fund_manager.block_margin(
-                        actual_margin_to_block, f"Order: {symbol} {action} {quantity}"
-                    )
-                    if not success:
-                        return (
-                            False,
-                            {"status": "error", "message": block_msg, "mode": "analyze"},
-                            400,
-                        )
-                    logger.info(
-                        f"Blocked margin ₹{actual_margin_to_block} for {symbol} {action} {quantity} order"
-                    )
-                else:
-                    logger.info(
-                        f"No margin to block for {symbol} {action} - will reduce existing position"
-                    )
+            if success and "data" in response:
+                quote_data = response["data"]
+                logger.debug(f"Fetched quote for {symbol}: LTP={quote_data.get('ltp', 0)}")
+                return quote_data
             else:
-                logger.info(
-                    f"No margin blocking required for {symbol} {action} {product} (CNC SELL of owned shares)"
+                # Log at debug level to avoid spam for permission errors
+                logger.debug(
+                    f"Could not fetch quote for {symbol}: {response.get('message', 'Unknown error')}"
                 )
-
-            # Generate unique order ID
-            orderid = self._generate_order_id()
-
-            # Check if order should be rejected (CNC SELL validation failed)
-            if cnc_sell_rejection_reason:
-                # Create rejected order for audit trail
-                # For MARKET orders, store the LTP we used for margin calculation as reference price
-                order_price_to_store = margin_calculation_price if price_type == "MARKET" else price
-
-                order = SandboxOrders(
-                    orderid=orderid,
-                    user_id=self.user_id,
-                    strategy=strategy,
-                    symbol=symbol,
-                    exchange=exchange,
-                    action=action,
-                    quantity=quantity,
-                    price=order_price_to_store,
-                    trigger_price=trigger_price,
-                    price_type=price_type,
-                    product=product,
-                    order_status="rejected",
-                    average_price=None,
-                    filled_quantity=0,
-                    pending_quantity=0,
-                    rejection_reason=cnc_sell_rejection_reason,
-                    margin_blocked=Decimal("0"),  # No margin blocked for rejected orders
-                    order_timestamp=datetime.now(pytz.timezone("Asia/Kolkata")),
-                )
-
-                db_session.add(order)
-                db_session.commit()
-
-                logger.info(
-                    f"Order rejected: {orderid} - {symbol} {action} {quantity} - Reason: {cnc_sell_rejection_reason}"
-                )
-
-                return (
-                    False,
-                    {
-                        "status": "error",
-                        "orderid": orderid,
-                        "message": cnc_sell_rejection_reason,
-                        "mode": "analyze",
-                    },
-                    400,
-                )
-
-            # Create order record (for accepted orders)
-            # For MARKET orders, store the LTP we used for margin calculation as reference price
-            order_price_to_store = margin_calculation_price if price_type == "MARKET" else price
-
-            order = SandboxOrders(
-                orderid=orderid,
-                user_id=self.user_id,
-                strategy=strategy,
-                symbol=symbol,
-                exchange=exchange,
-                action=action,
-                quantity=quantity,
-                price=order_price_to_store,
-                trigger_price=trigger_price,
-                price_type=price_type,
-                product=product,
-                order_status="open",
-                average_price=None,
-                filled_quantity=0,
-                pending_quantity=quantity,
-                rejection_reason=None,
-                margin_blocked=actual_margin_to_block,  # Store exact margin blocked
-                order_timestamp=datetime.now(pytz.timezone("Asia/Kolkata")),
-            )
-
-            db_session.add(order)
-            db_session.commit()
-
-            logger.info(f"Order placed: {orderid} - {symbol} {action} {quantity} @ {price_type}")
-
-            # Notify WebSocket execution engine to index and subscribe this symbol
-            try:
-                from sandbox.websocket_execution_engine import (
-                    get_websocket_execution_engine,
-                    is_websocket_execution_engine_running,
-                )
-
-                if is_websocket_execution_engine_running():
-                    engine = get_websocket_execution_engine()
-                    engine.notify_order_placed(order)
-            except Exception as e:
-                logger.debug(f"WebSocket execution engine notification skipped: {e}")
-
-            # Execute MARKET orders immediately using cached quote (no re-fetch needed)
-            if price_type == "MARKET":
-                try:
-                    from sandbox.execution_engine import ExecutionEngine
-
-                    engine = ExecutionEngine()
-
-                    # Use cached quote from margin calculation (already fetched above)
-                    if cached_quote:
-                        # Process the order immediately with cached quote
-                        engine._process_order(order, cached_quote)
-                        logger.info(f"Market order {orderid} executed immediately")
-                    else:
-                        logger.warning(
-                            f"Could not fetch quote for {symbol} on {exchange}, order remains open"
-                        )
-                except Exception as e:
-                    logger.exception(f"Error executing market order immediately: {e}")
-                    # Order remains in 'open' status if execution fails
-
-            return True, {"status": "success", "orderid": orderid, "mode": "analyze"}, 200
+                return None
 
         except Exception as e:
-            db_session.rollback()
-            logger.exception(f"Error placing order: {e}")
-            return (
-                False,
-                {"status": "error", "message": f"Error placing order: {str(e)}", "mode": "analyze"},
-                500,
-            )
+            # Handle all exceptions gracefully - don't stop execution engine
+            logger.debug(f"Exception fetching quote for {symbol}: {str(e)}")
+            return None
 
-    def modify_order(self, orderid, new_data):
+    def _fetch_quotes_batch(self, symbols_list):
         """
-        Modify an existing open order
-
-        Args:
-            orderid: str - Order ID to modify
-            new_data: dict - New order parameters (quantity, price, trigger_price)
-
-        Returns:
-            tuple: (success: bool, response: dict, status_code: int)
+        Fetch quotes for multiple symbols in a single API call using multiquotes.
+        Returns dict mapping (symbol, exchange) to quote data.
+        Returns empty dict if multiquotes fails completely.
         """
+        quote_cache = {}
+
+        if not symbols_list:
+            return quote_cache
+
         try:
-            # Get existing order
-            order = SandboxOrders.query.filter_by(orderid=orderid, user_id=self.user_id).first()
+            # Get any user's API key for fetching quotes
+            from database.auth_db import ApiKeys, decrypt_token
 
-            if not order:
-                return (
-                    False,
-                    {"status": "error", "message": f"Order {orderid} not found", "mode": "analyze"},
-                    404,
-                )
+            api_key_obj = ApiKeys.query.first()
 
-            if order.order_status != "open":
-                return (
-                    False,
-                    {
-                        "status": "error",
-                        "message": f"Cannot modify order in {order.order_status} status",
-                        "mode": "analyze",
-                    },
-                    400,
-                )
+            if not api_key_obj:
+                logger.debug("No API keys found for fetching multiquotes")
+                return quote_cache
 
-            # Update order parameters
-            if "quantity" in new_data:
-                new_quantity = int(new_data["quantity"])
-                # Validate lot size (from cache)
-                symbol_obj = get_symbol_info(order.symbol, order.exchange)
-                if symbol_obj and order.exchange in ["NFO", "BFO", "CDS", "BCD", "MCX", "NCDEX"]:
-                    lot_size = symbol_obj.lotsize or 1
-                    if new_quantity % lot_size != 0:
-                        return (
-                            False,
-                            {
-                                "status": "error",
-                                "message": f"Quantity must be in multiples of lot size {lot_size}",
-                                "mode": "analyze",
-                            },
-                            400,
-                        )
-                order.quantity = new_quantity
-                order.pending_quantity = new_quantity
+            # Decrypt the API key
+            api_key = decrypt_token(api_key_obj.api_key_encrypted)
 
-            if "price" in new_data and new_data["price"]:
-                order.price = Decimal(str(new_data["price"]))
+            # Prepare symbols list for multiquotes API
+            symbols_payload = [
+                {"symbol": symbol, "exchange": exchange} for symbol, exchange in symbols_list
+            ]
 
-            if "trigger_price" in new_data and new_data["trigger_price"]:
-                order.trigger_price = Decimal(str(new_data["trigger_price"]))
-
-            order.update_timestamp = datetime.now(pytz.timezone("Asia/Kolkata"))
-
-            db_session.commit()
-
-            logger.info(f"Order modified: {orderid}")
-
-            return (
-                True,
-                {
-                    "status": "success",
-                    "orderid": orderid,
-                    "message": "Order modified successfully",
-                    "mode": "analyze",
-                },
-                200,
+            # Use multiquotes service
+            success, response, status_code = get_multiquotes(
+                symbols=symbols_payload, api_key=api_key
             )
+
+            if success and "results" in response:
+                results = response["results"]
+                successful_count = 0
+
+                for result in results:
+                    symbol = result.get("symbol")
+                    exchange = result.get("exchange")
+
+                    # Check if this result has data or error
+                    if "data" in result and result["data"]:
+                        quote_data = result["data"]
+                        quote_cache[(symbol, exchange)] = quote_data
+                        logger.debug(f"Multiquotes: {symbol} LTP={quote_data.get('ltp', 0)}")
+                        successful_count += 1
+                    elif "error" in result:
+                        logger.debug(f"Multiquotes error for {symbol}: {result['error']}")
+
+                logger.info(
+                    f"Multiquotes fetched {successful_count}/{len(symbols_list)} symbols successfully"
+                )
+            else:
+                logger.debug(f"Multiquotes failed: {response.get('message', 'Unknown error')}")
 
         except Exception as e:
-            db_session.rollback()
-            logger.exception(f"Error modifying order {orderid}: {e}")
-            return (
-                False,
-                {
-                    "status": "error",
-                    "message": f"Error modifying order: {str(e)}",
-                    "mode": "analyze",
-                },
-                500,
-            )
+            logger.debug(f"Exception in multiquotes fetch: {str(e)}")
 
-    def cancel_order(self, orderid):
+        return quote_cache
+
+    def _process_order(self, order, quote):
         """
-        Cancel an existing open order
-
-        Args:
-            orderid: str - Order ID to cancel
-
-        Returns:
-            tuple: (success: bool, response: dict, status_code: int)
+        Process a single order based on current quote
+        Determines if order should be executed based on price type
         """
         try:
-            # Get existing order
-            order = SandboxOrders.query.filter_by(orderid=orderid, user_id=self.user_id).first()
-
-            if not order:
-                return (
-                    False,
-                    {"status": "error", "message": f"Order {orderid} not found", "mode": "analyze"},
-                    404,
+            # Check if this order already has a trade (prevent duplicates)
+            # This can happen with MARKET orders that are executed immediately on placement
+            # but the order status hasn't been updated to 'complete' yet due to race condition
+            existing_trade = SandboxTrades.query.filter_by(orderid=order.orderid).first()
+            if existing_trade:
+                logger.debug(
+                    f"Order {order.orderid} already has trade {existing_trade.tradeid}, skipping execution"
                 )
+                # Update order status to complete if it's still open (race condition cleanup)
+                if order.order_status == "open":
+                    order.order_status = "complete"
+                    order.average_price = existing_trade.price
+                    order.filled_quantity = order.quantity
+                    order.pending_quantity = 0
+                    order.update_timestamp = datetime.now(pytz.timezone("Asia/Kolkata"))
+                    db_session.commit()
+                    logger.info(
+                        f"Updated order {order.orderid} status to complete (was in race condition)"
+                    )
+                return
 
-            if order.order_status != "open":
-                return (
-                    False,
-                    {
-                        "status": "error",
-                        "message": f"Cannot cancel order in {order.order_status} status",
-                        "mode": "analyze",
-                    },
-                    400,
-                )
+            ltp = Decimal(str(quote.get("ltp", 0)))
+            bid = Decimal(str(quote.get("bid", 0)))
+            ask = Decimal(str(quote.get("ask", 0)))
+
+            if ltp <= 0:
+                logger.warning(f"Invalid LTP for order {order.orderid}: {ltp}")
+                return
+
+            # Determine if order should be executed based on price type
+            should_execute = False
+            execution_price = None
+
+            if order.price_type == "MARKET":
+                # Market orders execute immediately at bid/ask (more realistic)
+                # BUY: Execute at ask price (pay seller's asking price)
+                # SELL: Execute at bid price (receive buyer's bid price)
+                # If bid/ask is 0, fall back to LTP
+                should_execute = True
+                if order.action == "BUY":
+                    execution_price = ask if ask > 0 else ltp
+                else:  # SELL
+                    execution_price = bid if bid > 0 else ltp
+
+            elif order.price_type == "LIMIT":
+                # Limit BUY: Execute if LTP <= Limit Price, fill at limit price
+                # Limit SELL: Execute if LTP >= Limit Price, fill at limit price
+                # In real exchanges, limit orders sit on the book at the limit price
+                # and fill at that price when the market crosses through
+                if order.action == "BUY" and ltp <= order.price:
+                    should_execute = True
+                    execution_price = order.price  # Fill at limit price
+                elif order.action == "SELL" and ltp >= order.price:
+                    should_execute = True
+                    execution_price = order.price  # Fill at limit price
+
+            elif order.price_type == "SL":
+                # Stop Loss Limit order
+                # SL BUY: When LTP >= trigger price, order activates. Execute at LTP if LTP <= limit price
+                # SL SELL: When LTP <= trigger price, order activates. Execute at LTP if LTP >= limit price
+                if order.action == "BUY" and ltp >= order.trigger_price:
+                    if ltp <= order.price:
+                        should_execute = True
+                        execution_price = ltp  # Execute at current market price (LTP)
+                elif order.action == "SELL" and ltp <= order.trigger_price:
+                    if ltp >= order.price:
+                        should_execute = True
+                        execution_price = ltp  # Execute at current market price (LTP)
+
+            elif order.price_type == "SL-M":
+                # Stop Loss Market order
+                # BUY: Execute at market when LTP >= trigger price
+                # SELL: Execute at market when LTP <= trigger price
+                if order.action == "BUY" and ltp >= order.trigger_price:
+                    should_execute = True
+                    execution_price = ltp
+                elif order.action == "SELL" and ltp <= order.trigger_price:
+                    should_execute = True
+                    execution_price = ltp
+
+            # Execute the order if conditions are met
+            if should_execute:
+                self._execute_order(order, execution_price)
+
+        except Exception as e:
+            logger.exception(f"Error processing order {order.orderid}: {e}")
+
+    def _execute_order(self, order, execution_price):
+        """
+        Execute an order - create trade, update positions, release/adjust margin
+        """
+        try:
+            logger.info(
+                f"Executing order {order.orderid}: {order.symbol} {order.action} {order.quantity} @ {execution_price}"
+            )
+
+            # Generate trade ID
+            tradeid = self._generate_trade_id()
+
+            # Create trade record
+            trade = SandboxTrades(
+                tradeid=tradeid,
+                orderid=order.orderid,
+                user_id=order.user_id,
+                symbol=order.symbol,
+                exchange=order.exchange,
+                action=order.action,
+                quantity=order.quantity,
+                price=execution_price,
+                product=order.product,
+                strategy=order.strategy,
+                trade_timestamp=datetime.now(pytz.timezone("Asia/Kolkata")),
+            )
+
+            db_session.add(trade)
 
             # Update order status
-            order.order_status = "cancelled"
+            order.order_status = "complete"
+            order.average_price = execution_price
+            order.filled_quantity = order.quantity
+            order.pending_quantity = 0
             order.update_timestamp = datetime.now(pytz.timezone("Asia/Kolkata"))
-
-            # Release blocked margin using the exact amount that was blocked
-            if (
-                hasattr(order, "margin_blocked")
-                and order.margin_blocked
-                and order.margin_blocked > 0
-            ):
-                self.fund_manager.release_margin(
-                    order.margin_blocked, 0, f"Order cancelled: {orderid}"
-                )
-                logger.info(
-                    f"Released margin ₹{order.margin_blocked} for cancelled order {orderid}"
-                )
-            else:
-                # Fallback for old orders without margin_blocked field
-                # Need to recalculate margin that was blocked based on order parameters
-                # Get symbol info to determine if margin was blocked for this order (from cache)
-                symbol_obj = get_symbol_info(order.symbol, order.exchange)
-
-                if symbol_obj:
-                    # Determine if this order would have had margin blocked
-                    should_release_margin = False
-
-                    if order.action == "BUY":
-                        should_release_margin = True
-                    elif order.action == "SELL":
-                        if is_option(order.symbol, order.exchange) or is_future(
-                            order.symbol, order.exchange
-                        ):
-                            should_release_margin = True
-                        elif order.product in ["MIS", "NRML"]:
-                            should_release_margin = True
-
-                    if should_release_margin:
-                        # Get price for margin calculation
-                        if not order.price:
-                            # If price is not set (old MARKET orders), fetch current LTP
-                            try:
-                                from sandbox.execution_engine import ExecutionEngine
-
-                                engine = ExecutionEngine()
-                                quote = engine._fetch_quote(order.symbol, order.exchange)
-                                if quote and quote.get("ltp"):
-                                    order_price = Decimal(str(quote["ltp"]))
-                                else:
-                                    logger.error(
-                                        f"Cannot fetch LTP for {order.symbol} to calculate margin release"
-                                    )
-                                    order_price = Decimal("0")
-                            except Exception as e:
-                                logger.exception(f"Error fetching quote for margin release: {e}")
-                                order_price = Decimal("0")
-                        else:
-                            order_price = order.price
-
-                        # Calculate margin that was blocked
-                        if order_price > 0:
-                            margin_blocked, _ = self.fund_manager.calculate_margin_required(
-                                order.symbol,
-                                order.exchange,
-                                order.product,
-                                order.quantity,
-                                order_price,
-                                order.action,
-                            )
-                            if margin_blocked:
-                                self.fund_manager.release_margin(
-                                    margin_blocked, 0, f"Order cancelled: {orderid}"
-                                )
-                                logger.info(
-                                    f"Released calculated margin ₹{margin_blocked} for cancelled order {orderid}"
-                                )
-                    else:
-                        logger.info(
-                            f"No margin to release for cancelled order {orderid} ({order.action} {order.product})"
-                        )
 
             db_session.commit()
 
-            logger.info(f"Order cancelled: {orderid}")
+            # Update position
+            self._update_position(order, execution_price)
 
-            return (
-                True,
-                {
-                    "status": "success",
-                    "orderid": orderid,
-                    "message": "Order cancelled successfully",
-                    "mode": "analyze",
-                },
-                200,
-            )
+            logger.info(f"Order {order.orderid} executed successfully. Trade ID: {tradeid}")
 
         except Exception as e:
             db_session.rollback()
-            logger.exception(f"Error cancelling order {orderid}: {e}")
-            return (
-                False,
-                {
-                    "status": "error",
-                    "message": f"Error cancelling order: {str(e)}",
-                    "mode": "analyze",
-                },
-                500,
-            )
+            logger.exception(f"Error executing order {order.orderid}: {e}")
 
-    def get_orderbook(self):
-        """Get all orders for the user for current session only"""
+            # Mark order as rejected
+            try:
+                order.order_status = "rejected"
+                order.rejection_reason = f"Execution error: {str(e)}"
+                order.update_timestamp = datetime.now(pytz.timezone("Asia/Kolkata"))
+                db_session.commit()
+            except:
+                db_session.rollback()
+
+    def _update_position(self, order, execution_price):
+        """
+        Update or create position after trade execution
+        Handle netting for opposite positions
+
+        Note: Margin was already blocked when order was placed (for pending orders like LIMIT/SL/SL-M)
+        or during immediate execution (for MARKET orders). We only need to release margin when
+        positions are closed/reduced.
+        """
         try:
-            import os
-            from datetime import datetime, timedelta
-            from datetime import time as dt_time
+            fund_manager = FundManager(order.user_id)
 
-            # Get session expiry time from config (e.g., '03:00')
-            session_expiry_str = os.getenv("SESSION_EXPIRY_TIME", "03:00")
-            expiry_hour, expiry_minute = map(int, session_expiry_str.split(":"))
+            # Check if position exists
+            position = SandboxPositions.query.filter_by(
+                user_id=order.user_id,
+                symbol=order.symbol,
+                exchange=order.exchange,
+                product=order.product,
+            ).first()
 
-            # Get current time
-            now = datetime.now()
-            today = now.date()
+            if not position:
+                # Create new position
+                # Store the exact margin that was blocked at order placement time
+                order_margin = (
+                    order.margin_blocked
+                    if hasattr(order, "margin_blocked") and order.margin_blocked
+                    else Decimal("0.00")
+                )
+                position = SandboxPositions(
+                    user_id=order.user_id,
+                    symbol=order.symbol,
+                    exchange=order.exchange,
+                    product=order.product,
+                    quantity=order.quantity if order.action == "BUY" else -order.quantity,
+                    average_price=execution_price,
+                    ltp=execution_price,
+                    pnl=Decimal("0.00"),
+                    pnl_percent=Decimal("0.00"),
+                    accumulated_realized_pnl=Decimal("0.00"),
+                    margin_blocked=order_margin,  # Store exact margin from order
+                    created_at=datetime.now(pytz.timezone("Asia/Kolkata")),
+                )
+                db_session.add(position)
+                logger.info(
+                    f"Created new position: {order.symbol} {order.action} {order.quantity} (margin blocked: ₹{order_margin})"
+                )
 
-            # Calculate session start time
-            # If current time is before session expiry (e.g., before 3 AM),
-            # session started yesterday at expiry time
-            session_expiry_time = dt_time(expiry_hour, expiry_minute)
-
-            if now.time() < session_expiry_time:
-                # We're in the early morning before session expiry
-                # Session started yesterday at expiry time
-                session_start = datetime.combine(today - timedelta(days=1), session_expiry_time)
             else:
-                # We're after session expiry time
-                # Session started today at expiry time
-                session_start = datetime.combine(today, session_expiry_time)
+                # Update existing position (netting logic)
+                old_quantity = position.quantity
+                new_quantity = order.quantity if order.action == "BUY" else -order.quantity
+                final_quantity = old_quantity + new_quantity
 
-            orders = (
-                SandboxOrders.query.filter(
-                    SandboxOrders.user_id == self.user_id,
-                    SandboxOrders.order_timestamp >= session_start,
+                # Special case: Reopening a closed position (old_quantity = 0)
+                if old_quantity == 0:
+                    # Keep accumulated realized P&L from previous trades, start fresh unrealized P&L
+                    position.quantity = new_quantity
+                    position.average_price = execution_price
+                    position.ltp = execution_price
+                    position.pnl = Decimal("0.00")  # Reset current P&L (will be updated by MTM)
+                    position.pnl_percent = Decimal("0.00")
+                    # accumulated_realized_pnl stays as is from previous closed trades
+                    # today_realized_pnl: Keep current value (already reset at session boundary)
+                    # Store the exact margin that was blocked at order placement time
+                    order_margin = (
+                        order.margin_blocked
+                        if hasattr(order, "margin_blocked") and order.margin_blocked
+                        else Decimal("0.00")
+                    )
+                    position.margin_blocked = order_margin
+                    logger.info(
+                        f"Reopened position: {order.symbol} {order.action} {order.quantity} (accumulated realized P&L: ₹{position.accumulated_realized_pnl}) (margin blocked: ₹{order_margin})"
+                    )
+
+                elif final_quantity == 0:
+                    # Position closed completely
+                    # Calculate realized P&L
+                    realized_pnl = self._calculate_realized_pnl(
+                        old_quantity, position.average_price, abs(new_quantity), execution_price
+                    )
+
+                    # Release the EXACT margin that was stored in the position
+                    # This prevents over-release when execution price differs from order placement price
+                    margin_to_release = (
+                        position.margin_blocked
+                        if hasattr(position, "margin_blocked") and position.margin_blocked
+                        else Decimal("0.00")
+                    )
+
+                    if margin_to_release > 0:
+                        fund_manager.release_margin(
+                            margin_to_release, realized_pnl, f"Position closed: {order.symbol}"
+                        )
+                        logger.info(
+                            f"Released exact margin ₹{margin_to_release} for closed position (from position.margin_blocked)"
+                        )
+
+                    # Keep position with 0 quantity to show it was closed
+                    # Add realized P&L to accumulated realized P&L (all-time)
+                    position.accumulated_realized_pnl += realized_pnl
+                    # Add realized P&L to today's realized P&L (resets daily at session boundary)
+                    position.today_realized_pnl = (
+                        position.today_realized_pnl or Decimal("0.00")
+                    ) + realized_pnl
+
+                    position.quantity = 0
+                    position.margin_blocked = Decimal(
+                        "0.00"
+                    )  # Reset margin to 0 when position fully closed
+                    position.ltp = execution_price
+                    position.pnl = (
+                        position.today_realized_pnl
+                    )  # Display today's realized P&L for closed positions
+                    position.pnl_percent = Decimal("0.00")
+                    logger.info(
+                        f"Position closed: {order.symbol}, Realized P&L: ₹{realized_pnl}, Today's Realized P&L: ₹{position.today_realized_pnl}"
+                    )
+
+                elif (old_quantity > 0 and final_quantity > old_quantity) or (
+                    old_quantity < 0 and final_quantity < old_quantity
+                ):
+                    # Adding to existing position (same direction, position size increasing)
+                    # Calculate new average price
+                    total_value = (abs(old_quantity) * position.average_price) + (
+                        abs(new_quantity) * execution_price
+                    )
+                    total_quantity = abs(old_quantity) + abs(new_quantity)
+                    new_average_price = total_value / total_quantity
+
+                    position.quantity = final_quantity
+                    position.average_price = new_average_price
+                    position.ltp = execution_price
+
+                    # Accumulate margin - add the margin blocked for this order to existing position margin
+                    order_margin = (
+                        order.margin_blocked
+                        if hasattr(order, "margin_blocked") and order.margin_blocked
+                        else Decimal("0.00")
+                    )
+                    position.margin_blocked = (
+                        position.margin_blocked
+                        if hasattr(position, "margin_blocked") and position.margin_blocked
+                        else Decimal("0.00")
+                    ) + order_margin
+                    logger.info(
+                        f"Added to position: {order.symbol}, New qty: {final_quantity}, Avg: {new_average_price} (total margin blocked: ₹{position.margin_blocked})"
+                    )
+
+                else:
+                    # Reducing position (opposite direction) or position reversal
+                    reduced_quantity = min(abs(old_quantity), abs(new_quantity))
+
+                    # Calculate realized P&L for reduced portion
+                    realized_pnl = self._calculate_realized_pnl(
+                        old_quantity, position.average_price, reduced_quantity, execution_price
+                    )
+
+                    # Add realized P&L to accumulated realized P&L (all-time)
+                    # This tracks all partial closes
+                    position.accumulated_realized_pnl = (
+                        position.accumulated_realized_pnl or Decimal("0.00")
+                    ) + realized_pnl
+                    # Add realized P&L to today's realized P&L (resets daily at session boundary)
+                    position.today_realized_pnl = (
+                        position.today_realized_pnl or Decimal("0.00")
+                    ) + realized_pnl
+
+                    # Release margin PROPORTIONALLY for reduced quantity
+                    # Use exact margin stored in position, release proportionally
+                    current_margin = (
+                        position.margin_blocked
+                        if hasattr(position, "margin_blocked") and position.margin_blocked
+                        else Decimal("0.00")
+                    )
+
+                    if abs(old_quantity) > 0:
+                        # Calculate proportion of position being reduced
+                        reduction_proportion = Decimal(str(reduced_quantity)) / Decimal(
+                            str(abs(old_quantity))
+                        )
+                        margin_to_release = current_margin * reduction_proportion
+                    else:
+                        margin_to_release = Decimal("0.00")
+
+                    if margin_to_release > 0:
+                        fund_manager.release_margin(
+                            margin_to_release, realized_pnl, f"Position reduced: {order.symbol}"
+                        )
+                        logger.info(
+                            f"Released proportional margin ₹{margin_to_release} for reduced position ({reduction_proportion * 100:.1f}% of ₹{current_margin})"
+                        )
+
+                    # Update remaining margin after proportional release
+                    remaining_margin = current_margin - margin_to_release
+
+                    # If position reversed, set margin for new reversed position
+                    if abs(new_quantity) > abs(old_quantity):
+                        # Position reversed - remaining quantity creates opposite position
+                        remaining_quantity = abs(new_quantity) - abs(old_quantity)
+                        position.quantity = (
+                            remaining_quantity if order.action == "BUY" else -remaining_quantity
+                        )
+                        position.average_price = execution_price
+
+                        # For reversed position, the new margin comes from the excess quantity in the order
+                        # The old position's margin was fully released, new position gets fresh margin
+                        # Note: order.margin_blocked contains margin for the FULL order quantity
+                        # We need to calculate what portion corresponds to the excess quantity
+                        if abs(new_quantity) > 0:
+                            excess_proportion = Decimal(str(remaining_quantity)) / Decimal(
+                                str(abs(new_quantity))
+                            )
+                            order_margin = (
+                                order.margin_blocked
+                                if hasattr(order, "margin_blocked") and order.margin_blocked
+                                else Decimal("0.00")
+                            )
+                            new_position_margin = order_margin * excess_proportion
+                            position.margin_blocked = new_position_margin
+                            logger.info(
+                                f"Position reversed: {order.symbol}, New qty: {position.quantity} (new margin: ₹{new_position_margin})"
+                            )
+                        else:
+                            position.margin_blocked = Decimal("0.00")
+                    else:
+                        # Position reduced but not reversed - keep remaining margin
+                        position.quantity = final_quantity
+                        position.margin_blocked = remaining_margin
+                        logger.info(
+                            f"Position reduced: {order.symbol}, New qty: {final_quantity}, Remaining margin: ₹{remaining_margin}"
+                        )
+
+                    position.ltp = execution_price
+                    logger.info(
+                        f"Partial close: {order.symbol}, New qty: {final_quantity}, Realized P&L: ₹{realized_pnl}"
+                    )
+
+            db_session.commit()
+
+            # Validate margin consistency after position update
+            is_consistent, discrepancy = validate_margin_consistency(order.user_id)
+            if not is_consistent:
+                logger.warning(
+                    f"Margin inconsistency detected after position update for {order.symbol}: "
+                    f"discrepancy={discrepancy}. Auto-reconciling..."
                 )
-                .order_by(SandboxOrders.order_timestamp.desc())
-                .all()
-            )
-
-            orderbook = []
-            for order in orders:
-                orderbook.append(
-                    {
-                        "orderid": order.orderid,
-                        "symbol": order.symbol,
-                        "exchange": order.exchange,
-                        "action": order.action,
-                        "quantity": order.quantity,
-                        "price": float(order.price) if order.price else 0.0,
-                        "trigger_price": float(order.trigger_price) if order.trigger_price else 0.0,
-                        "pricetype": order.price_type,  # Match broker API format
-                        "product": order.product,
-                        "order_status": order.order_status,  # Match broker API format
-                        "average_price": float(order.average_price) if order.average_price else 0.0,
-                        "filled_quantity": order.filled_quantity,
-                        "pending_quantity": order.pending_quantity,
-                        "rejection_reason": order.rejection_reason
-                        or "",  # Include rejection reason
-                        "timestamp": order.order_timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                        "strategy": order.strategy or "",
-                    }
-                )
-
-            # Calculate statistics
-            statistics = self._calculate_order_statistics(orders)
-
-            return (
-                True,
-                {
-                    "status": "success",
-                    "data": {"orders": orderbook, "statistics": statistics},
-                    "mode": "analyze",
-                },
-                200,
-            )
+                # Auto-reconcile to prevent margin leaks
+                reconcile_margin(order.user_id, auto_fix=True)
 
         except Exception as e:
-            logger.exception(f"Error getting orderbook: {e}")
-            return (
-                False,
-                {
-                    "status": "error",
-                    "message": f"Error getting orderbook: {str(e)}",
-                    "mode": "analyze",
-                },
-                500,
-            )
+            db_session.rollback()
+            logger.exception(f"Error updating position for order {order.orderid}: {e}")
+            raise
 
-    def get_order_status(self, orderid):
-        """Get status of a specific order"""
+    def _calculate_realized_pnl(self, old_quantity, avg_price, close_quantity, close_price):
+        """Calculate realized P&L for closed positions"""
         try:
-            order = SandboxOrders.query.filter_by(orderid=orderid, user_id=self.user_id).first()
+            avg_price = Decimal(str(avg_price))
+            close_price = Decimal(str(close_price))
+            close_quantity = Decimal(str(close_quantity))
 
-            if not order:
-                return (
-                    False,
-                    {"status": "error", "message": f"Order {orderid} not found", "mode": "analyze"},
-                    404,
-                )
+            if old_quantity > 0:
+                # Long position closed
+                pnl = (close_price - avg_price) * close_quantity
+            else:
+                # Short position closed
+                pnl = (avg_price - close_price) * close_quantity
 
-            return (
-                True,
-                {
-                    "status": "success",
-                    "data": {
-                        "orderid": order.orderid,
-                        "symbol": order.symbol,
-                        "exchange": order.exchange,
-                        "action": order.action,
-                        "quantity": order.quantity,
-                        "price": float(order.price) if order.price else 0.0,
-                        "trigger_price": float(order.trigger_price) if order.trigger_price else 0.0,
-                        "price_type": order.price_type,
-                        "product": order.product,
-                        "order_status": order.order_status,
-                        "average_price": float(order.average_price) if order.average_price else 0.0,
-                        "filled_quantity": order.filled_quantity,
-                        "pending_quantity": order.pending_quantity,
-                        "timestamp": order.order_timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                        "strategy": order.strategy or "",
-                    },
-                    "mode": "analyze",
-                },
-                200,
-            )
+            return pnl
 
         except Exception as e:
-            logger.exception(f"Error getting order status: {e}")
-            return (
-                False,
-                {
-                    "status": "error",
-                    "message": f"Error getting order status: {str(e)}",
-                    "mode": "analyze",
-                },
-                500,
-            )
+            logger.exception(f"Error calculating realized P&L: {e}")
+            return Decimal("0.00")
 
-    def _validate_order(self, order_data):
-        """Validate order parameters"""
-        required_fields = ["symbol", "exchange", "action", "quantity", "price_type", "product"]
-
-        for field in required_fields:
-            if field not in order_data or not order_data[field]:
-                return False, f"Missing required field: {field}"
-
-        # Validate action
-        if order_data["action"].upper() not in ["BUY", "SELL"]:
-            return False, "Invalid action. Must be BUY or SELL"
-
-        # Validate price_type
-        if order_data["price_type"].upper() not in ["MARKET", "LIMIT", "SL", "SL-M"]:
-            return False, "Invalid price_type. Must be MARKET, LIMIT, SL, or SL-M"
-
-        # Validate product
-        if order_data["product"].upper() not in ["CNC", "NRML", "MIS"]:
-            return False, "Invalid product. Must be CNC, NRML, or MIS"
-
-        # Validate product-exchange compatibility
-        exchange = order_data["exchange"].upper()
-        product = order_data["product"].upper()
-
-        # Equity exchanges (NSE/BSE cash segment): Only CNC and MIS allowed
-        if exchange in ["NSE", "BSE"]:
-            if product == "NRML":
-                return (
-                    False,
-                    f"NRML product not allowed for {exchange} equity segment. Use CNC for delivery or MIS for intraday.",
-                )
-
-        # Derivatives exchanges (F&O, Commodity, Currency): Only NRML and MIS allowed
-        if exchange in ["NFO", "BFO", "MCX", "CDS", "BCD", "NCDEX"]:
-            if product == "CNC":
-                return (
-                    False,
-                    f"CNC product not allowed for {exchange} derivatives segment. Use NRML for carryforward or MIS for intraday.",
-                )
-
-        # Validate quantity
-        try:
-            quantity = int(order_data["quantity"])
-            if quantity <= 0:
-                return False, "Quantity must be positive"
-        except (ValueError, TypeError):
-            return False, "Invalid quantity"
-
-        # Validate price for LIMIT and SL orders
-        if order_data["price_type"].upper() in ["LIMIT", "SL"]:
-            if "price" not in order_data or not order_data["price"]:
-                return False, f"{order_data['price_type']} orders require price"
-            try:
-                price = float(order_data["price"])
-                if price <= 0:
-                    return False, "Price must be positive"
-            except (ValueError, TypeError):
-                return False, "Invalid price"
-
-        # Validate trigger_price for SL and SL-M orders
-        if order_data["price_type"].upper() in ["SL", "SL-M"]:
-            if "trigger_price" not in order_data or not order_data["trigger_price"]:
-                return False, f"{order_data['price_type']} orders require trigger_price"
-            try:
-                trigger_price = float(order_data["trigger_price"])
-                if trigger_price <= 0:
-                    return False, "Trigger price must be positive"
-            except (ValueError, TypeError):
-                return False, "Invalid trigger_price"
-
-        # Validate exchange
-        valid_exchanges = ["NSE", "BSE", "NFO", "BFO", "CDS", "BCD", "MCX", "NCDEX"]
-        if order_data["exchange"].upper() not in valid_exchanges:
-            return False, f"Invalid exchange. Must be one of {', '.join(valid_exchanges)}"
-
-        return True, "Validation passed"
-
-    def _generate_order_id(self):
-        """
-        Generate unique order ID in format: YYMMDD + 8-digit unique sequence
-        Example: 25100112345678 (Year 2025, Oct 1st, unique sequence)
-
-        Uses microsecond timestamp + random component to avoid race conditions
-        when multiple orders are placed in parallel.
-        """
-        import random
-
+    def _generate_trade_id(self):
+        """Generate unique trade ID"""
         now = datetime.now(pytz.timezone("Asia/Kolkata"))
-        date_prefix = now.strftime("%y%m%d")  # YYMMDD format
+        timestamp = now.strftime("%Y%m%d-%H%M%S")
+        unique_id = str(uuid.uuid4())[:8]
+        return f"TRADE-{timestamp}-{unique_id}"
 
-        # Use microseconds (0-999999) + random (0-99) for 8-digit unique sequence
-        # This avoids race conditions when parallel orders query count simultaneously
-        micro = now.microsecond
-        rand_suffix = random.randint(0, 99)
 
-        # Combine: first 6 digits from microseconds, last 2 from random
-        sequence = f"{micro:06d}{rand_suffix:02d}"
+def run_execution_engine_once():
+    """Run one cycle of the execution engine"""
+    engine = ExecutionEngine()
+    engine.check_and_execute_pending_orders()
 
-        return f"{date_prefix}{sequence}"
 
-    def _calculate_order_statistics(self, orders):
-        """Calculate order statistics matching broker API format"""
-        # Count orders by action
-        total_buy_orders = sum(1 for o in orders if o.action == "BUY")
-        total_sell_orders = sum(1 for o in orders if o.action == "SELL")
+if __name__ == "__main__":
+    """Run execution engine in standalone mode for testing"""
+    logger.info("Starting Sandbox Execution Engine")
 
-        # Count orders by status
-        total_completed_orders = sum(1 for o in orders if o.order_status == "complete")
-        total_open_orders = sum(1 for o in orders if o.order_status == "open")
-        total_rejected_orders = sum(1 for o in orders if o.order_status == "rejected")
+    # Get check interval from config
+    from database.sandbox_db import init_db
 
-        return {
-            "total_buy_orders": total_buy_orders,
-            "total_sell_orders": total_sell_orders,
-            "total_completed_orders": total_completed_orders,
-            "total_open_orders": total_open_orders,
-            "total_rejected_orders": total_rejected_orders,
-        }
+    init_db()
+
+    check_interval = int(get_config("order_check_interval", "5"))
+    logger.info(f"Order check interval: {check_interval} seconds")
+
+    try:
+        while True:
+            run_execution_engine_once()
+            time.sleep(check_interval)
+    except KeyboardInterrupt:
+        logger.info("Execution engine stopped by user")
+    except Exception as e:
+        logger.exception(f"Execution engine error: {e}")
