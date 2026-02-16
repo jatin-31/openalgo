@@ -154,6 +154,13 @@ export default function BrokerSelect() {
         loginUrl = '/dhan/initiate-oauth'
         break
 
+      case 'hdfc_investright': {
+        const state = generateRandomState()
+        localStorage.setItem('hdfc_investright_oauth_state', state)
+        loginUrl = `https://developer.hdfcsec.com/oauth/authorize?client_id=${broker_api_key}&redirect_uri=${redirect_url}&response_type=code&state=${state}&scope=trading placement`
+        break
+      }
+
       case 'compositedge':
         loginUrl = `https://xts.compositedge.com/interactive/thirdparty?appKey=${broker_api_key}&returnURL=${redirect_url}`
         break
@@ -244,13 +251,11 @@ export default function BrokerSelect() {
                       <SelectValue placeholder="Select a Broker" />
                     </SelectTrigger>
                     <SelectContent>
-                      {allBrokers
-                        .filter((broker) => broker.id === brokerConfig?.broker_name)  // ← THIS FILTERS!
-                        .map((broker) => (
-                          <SelectItem key={broker.id} value={broker.id}>
-                            {broker.name}
-                          </SelectItem>
-                        ))}
+                      {allBrokers.map((broker) => (
+                        <SelectItem key={broker.id} value={broker.id}>
+                          {broker.name}
+                        </SelectItem>
+                      ))}
                     </SelectContent>
                   </Select>
                 </div>
